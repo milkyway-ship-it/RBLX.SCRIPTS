@@ -1,7 +1,7 @@
-
-
-
-
+-- Player Toolkit v2
+-- One window: players list, orbit, map orbit (safe mode), finder (view/teleport) + ESP.
+-- Every hotkey defaults to None. Click a key box, then press a key (Esc clears it).
+-- Right-click a row (or click its "...") to open that feature's settings.
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -19,9 +19,9 @@ end
 
 local TAU = math.pi * 2
 
-
-
-
+------------------------------------------------------------------
+-- Theme + helpers
+------------------------------------------------------------------
 local THEME = {
 	bg = Color3.fromRGB(22, 22, 30),
 	title = Color3.fromRGB(34, 34, 50),
@@ -51,30 +51,110 @@ local function thumb(userId)
 	return string.format("rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150", userId)
 end
 
+------------------------------------------------------------------
+-- State
+------------------------------------------------------------------
+local HttpService = game:GetService("HttpService")
 
-
-
-local State = {
-	selected = nil,
-	
+local DEFAULTS = {
 	distance = 8,
 	height = 2,
 	spectate = true,
-	
-	mapDistance = 150000,
+	mapDistance = 2000000,
 	mapHeight = 400,
 	autoMap = false,
-	
-	viewActive = false,
+	teamer = false,
+	teamerRadius = 50,
+	teamerCount = 2,
+	espAll = true,
 	esp = { box = false, skeleton = false, chams = false, names = false },
 }
 
+local State = {
+	selected = nil,
+	viewActive = false,
+	distance = DEFAULTS.distance,
+	height = DEFAULTS.height,
+	spectate = DEFAULTS.spectate,
+	mapDistance = DEFAULTS.mapDistance,
+	mapHeight = DEFAULTS.mapHeight,
+	autoMap = DEFAULTS.autoMap,
+	teamer = DEFAULTS.teamer,
+	teamerRadius = DEFAULTS.teamerRadius,
+	teamerCount = DEFAULTS.teamerCount,
+	espAll = DEFAULTS.espAll,
+	espIds = {}, -- [UserId] = true: players ticked for ESP (survives respawn, leave and rejoin)
+	esp = {
+		box = DEFAULTS.esp.box,
+		skeleton = DEFAULTS.esp.skeleton,
+		chams = DEFAULTS.esp.chams,
+		names = DEFAULTS.esp.names,
+	},
+}
 
+-- every hotkey starts as None (until you bind one or a saved file is loaded)
 local binds = {}
 local bindButtons = {}
 local listening = nil
 
+local resetters = {} -- one function per setting widget, used by "Reset settings"
 
+local function defVal(key)
+	if string.sub(key, 1, 4) == "esp." then
+		return DEFAULTS.esp[string.sub(key, 5)]
+	end
+	return DEFAULTS[key]
+end
+
+-- Hotkeys are saved to PlayerToolkit_hotkeys.json (executor workspace folder).
+local CONFIG_FILE = "PlayerToolkit_hotkeys.json"
+local BIND_NAMES = { Orbit = true, MapOrbit = true, AutoTarget = true, View = true, Teleport = true }
+
+local uiReady = false
+local saveDirty = nil
+
+local function saveConfig()
+	local data = { binds = {} }
+	for name, kc in pairs(binds) do
+		data.binds[name] = kc.Name
+	end
+	pcall(function()
+		if writefile then
+			writefile(CONFIG_FILE, HttpService:JSONEncode(data))
+		end
+	end)
+end
+
+local function queueSave()
+	if uiReady then
+		saveDirty = os.clock()
+	end
+end
+
+local function loadConfig()
+	local ok, data = pcall(function()
+		if isfile and readfile and isfile(CONFIG_FILE) then
+			return HttpService:JSONDecode(readfile(CONFIG_FILE))
+		end
+	end)
+	if not ok or type(data) ~= "table" or type(data.binds) ~= "table" then
+		return
+	end
+	for name, keyName in pairs(data.binds) do
+		if BIND_NAMES[name] and type(keyName) == "string" then
+			local okk, kc = pcall(function()
+				return Enum.KeyCode[keyName]
+			end)
+			if okk and kc then
+				binds[name] = kc
+			end
+		end
+	end
+end
+
+loadConfig()
+
+-- forward declarations
 local startOrbit, stopOrbit, startMap, stopMap, setView, teleportToTarget, autoTarget, setSelected
 local orbitRow, mapRow, viewRow
 local statusLabel
@@ -85,9 +165,9 @@ local function setStatus(text)
 	end
 end
 
-
-
-
+------------------------------------------------------------------
+-- Window
+------------------------------------------------------------------
 local gui = new("ScreenGui", {
 	Name = "PlayerToolkit",
 	ResetOnSpawn = false,
@@ -149,7 +229,7 @@ minimizeButton.MouseButton1Click:Connect(function()
 	minimizeButton.Text = minimized and "+" or "-"
 end)
 
-
+-- Dragging (mouse + touch) from the title bar
 do
 	local dragging = false
 	local dragStart, startPos
@@ -178,7 +258,7 @@ do
 	end)
 end
 
-
+-- Target bar (always visible)
 local targetBar = new("Frame", {
 	Size = UDim2.new(1, -20, 0, 36),
 	Position = UDim2.fromOffset(10, 6),
@@ -274,9 +354,9 @@ local playersPage = makeTab(1, "PLAYERS")
 local orbitPage = makeTab(2, "ORBIT")
 local finderPage = makeTab(3, "FINDER")
 
-
-
-
+------------------------------------------------------------------
+-- Widgets
+------------------------------------------------------------------
 local function makePill(parent, default, onChange)
 	local pill = new("TextButton", {
 		Size = UDim2.fromOffset(40, 20),
@@ -355,7 +435,7 @@ local function makeKeybind(parent, name)
 	return b
 end
 
-
+-- Feature row: label, "..." settings, toggle, hotkey. Right-click opens settings too.
 local function makeRow(parent, y, text, bindName, onChange, onSettings)
 	local holder = new("Frame", {
 		Size = UDim2.new(1, 0, 0, 28),
@@ -401,8 +481,8 @@ local function makeRow(parent, y, text, bindName, onChange, onSettings)
 	return obj
 end
 
-
-local function makeSwitch(parent, y, text, default, onChange)
+-- Simple label + toggle (used inside settings panels)
+local function makeSwitch(parent, y, text, default, onChange, key)
 	local holder = new("Frame", {
 		Size = UDim2.new(1, 0, 0, 26),
 		Position = UDim2.fromOffset(0, y),
@@ -419,6 +499,11 @@ local function makeSwitch(parent, y, text, default, onChange)
 		TextTruncate = Enum.TextTruncate.AtEnd,
 	}, holder)
 	local obj = makePill(holder, default, onChange)
+	if key then
+		resetters[#resetters + 1] = function()
+			obj:Set(defVal(key))
+		end
+	end
 	return obj
 end
 
@@ -442,7 +527,7 @@ local function makeBindRow(parent, y, text, bindName)
 	return holder
 end
 
-local function makeSlider(parent, y, name, min, max, default, step, formatter, onChange)
+local function makeSlider(parent, y, name, min, max, default, step, formatter, onChange, key)
 	local holder = new("Frame", {
 		Size = UDim2.new(1, 0, 0, 34),
 		Position = UDim2.fromOffset(0, y),
@@ -530,6 +615,11 @@ local function makeSlider(parent, y, name, min, max, default, step, formatter, o
 	end)
 
 	setValue(default)
+	if key then
+		resetters[#resetters + 1] = function()
+			setValue(defVal(key))
+		end
+	end
 end
 
 local function makeHint(parent, y, height, text)
@@ -547,7 +637,7 @@ local function makeHint(parent, y, height, text)
 	}, parent)
 end
 
-
+-- Settings panels (cover the tab area, "Back" returns)
 local panels = {}
 local function makePanel(titleText)
 	local p = new("Frame", {
@@ -605,9 +695,9 @@ local orbitPanel, orbitBody = makePanel("Orbit settings")
 local mapPanel, mapBody = makePanel("Map orbit settings")
 local viewPanel, viewBody = makePanel("View settings")
 
-
-
-
+------------------------------------------------------------------
+-- PLAYERS tab (shared target list with avatars)
+------------------------------------------------------------------
 local search = new("TextBox", {
 	Size = UDim2.new(1, 0, 0, 28),
 	BackgroundColor3 = THEME.item,
@@ -691,7 +781,7 @@ local function addEntry(p)
 	}, button)
 	round(avatar, 17)
 	new("TextLabel", {
-		Size = UDim2.new(1, -50, 0, 18),
+		Size = UDim2.new(1, -92, 0, 18),
 		Position = UDim2.fromOffset(44, 3),
 		BackgroundTransparency = 1,
 		Text = p.DisplayName,
@@ -702,7 +792,7 @@ local function addEntry(p)
 		TextTruncate = Enum.TextTruncate.AtEnd,
 	}, button)
 	new("TextLabel", {
-		Size = UDim2.new(1, -50, 0, 14),
+		Size = UDim2.new(1, -92, 0, 14),
 		Position = UDim2.fromOffset(44, 21),
 		BackgroundTransparency = 1,
 		Text = "@" .. p.Name,
@@ -716,6 +806,28 @@ local function addEntry(p)
 	button.MouseButton1Click:Connect(function()
 		setSelected(p)
 		setStatus("Target: " .. p.Name)
+	end)
+
+	-- ESP tick: tracks several players at once. Keyed by UserId so it survives death / leave / rejoin.
+	local espBtn = new("TextButton", {
+		Size = UDim2.fromOffset(38, 22),
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -4, 0.5, 0),
+		BorderSizePixel = 0,
+		Text = "ESP",
+		Font = Enum.Font.GothamBold,
+		TextSize = 11,
+		TextColor3 = THEME.text,
+	}, button)
+	round(espBtn, 5)
+	local function paintEsp()
+		espBtn.BackgroundColor3 = State.espIds[p.UserId] and THEME.accent or THEME.off
+	end
+	paintEsp()
+	espBtn.MouseButton1Click:Connect(function()
+		State.espIds[p.UserId] = (not State.espIds[p.UserId]) or nil
+		paintEsp()
+		setStatus((State.espIds[p.UserId] and "ESP on for " or "ESP off for ") .. p.Name)
 	end)
 	applyFilter()
 	refreshSelection()
@@ -734,46 +846,56 @@ for _, p in ipairs(Players:GetPlayers()) do
 end
 Players.PlayerAdded:Connect(addEntry)
 
-
-
-
-
+------------------------------------------------------------------
+-- Settings panel contents
+------------------------------------------------------------------
+-- Orbit
 makeSlider(orbitBody, 4, "Distance", 4, 60, State.distance, 0.5,
 	function(v) return string.format("%.1f", v) end,
-	function(v) State.distance = v end)
+	function(v) State.distance = v end, "distance")
 makeSlider(orbitBody, 44, "Height", 0, 30, State.height, 0.5,
 	function(v) return string.format("%.1f", v) end,
-	function(v) State.height = v end)
+	function(v) State.height = v end, "height")
 makeSwitch(orbitBody, 90, "Spectate target while orbiting", State.spectate, function(v)
 	State.spectate = v
-end)
-makeHint(orbitBody, 126, 120,
-	"Speed is fixed at maximum and can't be changed. The motion is fully random (up, down, left, right, hops, tumbles) and the whole pattern re-rolls every 60 seconds. You can't choose the direction.")
+end, "spectate")
+makeHint(orbitBody, 126, 150,
+	"Speed is fixed at maximum and can't be changed. The motion is fully random and picks from 36 different patterns (rings, helixes, stars, figure-8s, square waves, hops, tumbles and more). A new pattern is picked every 5 seconds. You can't choose the direction.")
 
-
-makeSlider(mapBody, 4, "Distance from start", 20000, 600000, State.mapDistance, 5000,
-	function(v) return string.format("%d", v) end,
-	function(v) State.mapDistance = v end)
+-- Map orbit
+makeSlider(mapBody, 4, "Distance from start", 100000, 20000000, State.mapDistance, 100000,
+	function(v) return string.format("%.1fM", v / 1000000) end,
+	function(v) State.mapDistance = v end, "mapDistance")
 makeSlider(mapBody, 44, "Height (Y)", -400, 5000, State.mapHeight, 50,
 	function(v) return string.format("%d", v) end,
-	function(v) State.mapHeight = v end)
-makeSwitch(mapBody, 90, "Auto map orbit when damaged", State.autoMap, function(v)
+	function(v) State.mapHeight = v end, "mapHeight")
+makeSwitch(mapBody, 88, "Auto map orbit when damaged", State.autoMap, function(v)
 	State.autoMap = v
-end)
-makeHint(mapBody, 126, 150,
-	"Safe mode: throws you around the map at an extreme distance with fixed max speed and random patterns (new pattern every 60 s). Height never goes below the void kill line. Turning it off puts you back where you started. If you die it just stops.")
+end, "autoMap")
+makeSwitch(mapBody, 118, "Anti-teamer (auto map orbit)", State.teamer, function(v)
+	State.teamer = v
+end, "teamer")
+makeSlider(mapBody, 148, "Teamer radius", 10, 200, State.teamerRadius, 5,
+	function(v) return string.format("%d studs", v) end,
+	function(v) State.teamerRadius = v end, "teamerRadius")
+makeSlider(mapBody, 186, "Players needed", 2, 6, State.teamerCount, 1,
+	function(v) return string.format("%d", v) end,
+	function(v) State.teamerCount = v end, "teamerCount")
+makeHint(mapBody, 226, 96,
+	"Safe mode: throws you around the map millions of studs out (your character will distort) at max speed with random patterns, new pattern every 5 s. Height never goes below the void kill line. Off = back at your start. Anti-teamer: when that many players are inside the radius around you, map orbit turns on by itself, and turns off 5 s after they leave.")
 
+-- View / ESP
+makeSwitch(viewBody, 4, "ESP: Box", State.esp.box, function(v) State.esp.box = v end, "esp.box")
+makeSwitch(viewBody, 36, "ESP: Skeleton", State.esp.skeleton, function(v) State.esp.skeleton = v end, "esp.skeleton")
+makeSwitch(viewBody, 68, "ESP: Chams", State.esp.chams, function(v) State.esp.chams = v end, "esp.chams")
+makeSwitch(viewBody, 100, "ESP: Names / distance / health", State.esp.names, function(v) State.esp.names = v end, "esp.names")
+makeSwitch(viewBody, 132, "ESP everyone (off = only ticked)", State.espAll, function(v) State.espAll = v end, "espAll")
+makeHint(viewBody, 170, 130,
+	"ESP draws through walls. Tick the ESP button on players in the PLAYERS tab to follow several at once; ticks stay when they die, respawn, leave and rejoin. The selected target is red, everyone else is blue. ESP works whether or not View is on.")
 
-makeSwitch(viewBody, 4, "ESP: Box", State.esp.box, function(v) State.esp.box = v end)
-makeSwitch(viewBody, 36, "ESP: Skeleton", State.esp.skeleton, function(v) State.esp.skeleton = v end)
-makeSwitch(viewBody, 68, "ESP: Chams", State.esp.chams, function(v) State.esp.chams = v end)
-makeSwitch(viewBody, 100, "ESP: Names / distance / health", State.esp.names, function(v) State.esp.names = v end)
-makeHint(viewBody, 140, 100,
-	"ESP draws on every other player, through walls. The selected target is red, everyone else is blue. ESP works whether or not View is on.")
-
-
-
-
+------------------------------------------------------------------
+-- ORBIT tab
+------------------------------------------------------------------
 orbitRow = makeRow(orbitPage, 0, "Orbit player", "Orbit", function(on)
 	if on then
 		startOrbit()
@@ -796,12 +918,51 @@ end)
 
 makeBindRow(orbitPage, 68, "Auto target (cursor / nearest)", "AutoTarget")
 
-makeHint(orbitPage, 108, 120,
-	"Pick a target in PLAYERS, then turn on Orbit. Map orbit needs no target.\nRight-click a row (or click ...) for its settings. Click a key box, then press a key to bind it; Esc clears it.")
+makeHint(orbitPage, 108, 90,
+	"Pick a target in PLAYERS, then turn on Orbit. Map orbit needs no target.\nRight-click a row (or click ...) for its settings. Click a key box, then press a key to bind it; Esc clears it. Hotkeys are saved automatically.")
 
+do
+	local function resetSettings()
+		for _, fn in ipairs(resetters) do
+			fn()
+		end
+		setStatus("Settings reset to default")
+	end
+	local function resetHotkeys()
+		listening = nil
+		for name in pairs(bindButtons) do
+			binds[name] = nil
+			refreshBind(name)
+		end
+		queueSave()
+		setStatus("Hotkeys reset (all None)")
+	end
+	local holder = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 28),
+		Position = UDim2.fromOffset(0, 204),
+		BackgroundTransparency = 1,
+	}, orbitPage)
+	local function resetButton(text, xScale, xOffset, fn)
+		local b = new("TextButton", {
+			Size = UDim2.new(0.5, -3, 1, 0),
+			Position = UDim2.new(xScale, xOffset, 0, 0),
+			BackgroundColor3 = THEME.off,
+			BorderSizePixel = 0,
+			Text = text,
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			TextColor3 = THEME.text,
+		}, holder)
+		round(b, 5)
+		b.MouseButton1Click:Connect(fn)
+	end
+	resetButton("Reset settings", 0, 0, resetSettings)
+	resetButton("Reset hotkeys", 0.5, 3, resetHotkeys)
+end
 
-
-
+------------------------------------------------------------------
+-- FINDER tab
+------------------------------------------------------------------
 viewRow = makeRow(finderPage, 0, "View player", "View", function(on)
 	setView(on)
 end, function()
@@ -835,9 +996,9 @@ makeHint(finderPage, 74, 120,
 
 showTab("PLAYERS")
 
-
-
-
+------------------------------------------------------------------
+-- Random fast pattern engine (shared by orbit + map orbit)
+------------------------------------------------------------------
 local rng = Random.new()
 local function rnd(a, b)
 	return a + rng:NextNumber() * (b - a)
@@ -845,8 +1006,8 @@ end
 local function rsign()
 	return rng:NextNumber() < 0.5 and -1 or 1
 end
-local function fastW() 
-	return rsign() * math.rad(rnd(2200, 5200))
+local function fastW() -- rad/s, always extremely fast (25 to 66 turns per second)
+	return rsign() * math.rad(rnd(9000, 24000))
 end
 local function sph(theta, phi)
 	local c = math.cos(phi)
@@ -854,12 +1015,125 @@ local function sph(theta, phi)
 end
 
 local STYLES = { "Spin", "Vertical", "Blink", "Cross", "Lissajous", "Tumble" }
+
+-- 30 more shapes. Each returns a vector (x, y, z) from a fast phase p and a slow phase q.
+local sin, cos, abs, floor = math.sin, math.cos, math.abs, math.floor
+local PI = math.pi
+local function tri(x)
+	return (2 / PI) * math.asin(math.sin(x))
+end
+local function sgn(x)
+	return x >= 0 and 1 or -1
+end
+local function poly(n, p)
+	local seg = TAU / n
+	local a = p % seg
+	return cos(PI / n) / cos(a - PI / n)
+end
+
+local SHAPE_ORDER = {
+	"Ring", "VRing", "Helix", "Saddle", "WaveRing", "ZigZag", "Trefoil", "Star5", "Rose3", "Breathe",
+	"Liss3A", "Liss3B", "CubeBounce", "Square", "Triangle", "Pentagon", "Pendulum", "LeftRight", "Pogo", "Plus",
+	"Tornado", "Bounce", "PulseRing", "Epicycle", "Hypo", "Cardioid", "GoldenHop", "Gyro", "SquareWave", "Sawtooth",
+}
+
+local SHAPES = {
+	Ring = function(p, q) return cos(p), 0, sin(p) end,
+	VRing = function(p, q) return cos(p), sin(p), 0 end,
+	Helix = function(p, q) return cos(p), 0.7 * sin(q), sin(p) end,
+	Saddle = function(p, q) return cos(p), 0.8 * sin(2 * p), sin(p) end,
+	WaveRing = function(p, q) return cos(p), 0.8 * sin(5 * p), sin(p) end,
+	ZigZag = function(p, q) return cos(p), 0.9 * tri(4 * p), sin(p) end,
+	Trefoil = function(p, q)
+		return (sin(p) + 2 * sin(2 * p)) / 3, (cos(p) - 2 * cos(2 * p)) / 3, -sin(3 * p) / 1.5
+	end,
+	Star5 = function(p, q)
+		local r = (1 + 0.45 * cos(5 * p)) * 0.8
+		return r * cos(p), 0.35 * sin(5 * p), r * sin(p)
+	end,
+	Rose3 = function(p, q)
+		local r = cos(3 * p)
+		return r * cos(p), 0.5 * sin(p), r * sin(p)
+	end,
+	Breathe = function(p, q)
+		local r = 0.5 + 0.5 * abs(sin(q))
+		return r * cos(p), 0.3 * sin(2 * p), r * sin(p)
+	end,
+	Liss3A = function(p, q) return sin(3 * p), sin(2 * p + 1), sin(5 * p + 2) end,
+	Liss3B = function(p, q) return sin(2 * p), sin(3 * p + 0.5), sin(7 * p + 1.3) end,
+	CubeBounce = function(p, q) return tri(p), tri(1.3 * p + 0.4), tri(1.7 * p + 1.1) end,
+	Square = function(p, q)
+		return math.max(-1, math.min(1, 1.4 * cos(p))), 0, math.max(-1, math.min(1, 1.4 * sin(p)))
+	end,
+	Triangle = function(p, q)
+		local r = poly(3, p)
+		return r * cos(p), 0.2 * sin(3 * p), r * sin(p)
+	end,
+	Pentagon = function(p, q)
+		local r = poly(5, p)
+		return r * cos(p), 0.2 * sin(5 * p), r * sin(p)
+	end,
+	Pendulum = function(p, q) return sin(p), 0.5 * cos(p), 0.5 end,
+	LeftRight = function(p, q) return sgn(sin(p)), 0.25 * sin(3 * p), 0.3 * cos(q) end,
+	Pogo = function(p, q) return 0.4 * cos(q), tri(p), 0.4 * sin(q) end,
+	Plus = function(p, q)
+		local i = floor(p / (PI / 2)) % 4
+		if i == 0 then
+			return 1, 0, 0
+		elseif i == 1 then
+			return 0, 1, 0
+		elseif i == 2 then
+			return -1, 0, 0
+		end
+		return 0, -1, 0
+	end,
+	Tornado = function(p, q)
+		local y = tri(q)
+		local r = 1 - 0.6 * abs(y)
+		return r * cos(p), y, r * sin(p)
+	end,
+	Bounce = function(p, q) return cos(p), abs(sin(q)), sin(p) end,
+	PulseRing = function(p, q)
+		local r = sgn(sin(q)) > 0 and 1.3 or 0.5
+		return r * cos(p), 0, r * sin(p)
+	end,
+	Epicycle = function(p, q)
+		return (cos(p) + 0.5 * cos(6 * p)) * 0.7, 0.35 * sin(6 * p), (sin(p) + 0.5 * sin(6 * p)) * 0.7
+	end,
+	Hypo = function(p, q)
+		return (2 * cos(p) + cos(4 * p)) / 3 * 1.1, 0.3 * sin(3 * p), (2 * sin(p) - sin(4 * p)) / 3 * 1.1
+	end,
+	Cardioid = function(p, q)
+		local r = 0.6 + 0.4 * cos(p)
+		return r * cos(p), 0.3 * sin(2 * p), r * sin(p)
+	end,
+	GoldenHop = function(p, q)
+		local i = floor(p / (PI / 3))
+		local th = i * 2.399963
+		local y = 1 - 2 * ((i * 0.618034) % 1)
+		local rr = math.sqrt(math.max(0, 1 - y * y))
+		return rr * cos(th), y * 0.8, rr * sin(th)
+	end,
+	Gyro = function(p, q)
+		local c = cos(p)
+		return c * cos(q), sin(p), -c * sin(q)
+	end,
+	SquareWave = function(p, q) return cos(q), 0.9 * sgn(sin(p)), sin(q) end,
+	Sawtooth = function(p, q)
+		local y = ((p % TAU) / PI) - 1
+		return cos(3 * p), y, sin(3 * p)
+	end,
+}
+
+for _, name in ipairs(SHAPE_ORDER) do
+	STYLES[#STYLES + 1] = name
+end
 local CROSS = {
-	Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0), 
-	Vector3.new(0, 1, 0), Vector3.new(0, -1, 0), 
+	Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0), -- right / left
+	Vector3.new(0, 1, 0), Vector3.new(0, -1, 0), -- up / down
 	Vector3.new(1, 1, 0).Unit, Vector3.new(-1, 1, 0).Unit,
 	Vector3.new(1, -1, 0).Unit, Vector3.new(-1, -1, 0).Unit,
-	Vector3.new(0, 0, 1), Vector3.new(0, 0, -1), 
+	Vector3.new(0, 0, 1), Vector3.new(0, 0, -1), -- front / back
 }
 
 local pat = {
@@ -884,24 +1158,50 @@ local function rollPattern(now)
 		end
 	end
 	pat.style = choices[rng:NextInteger(1, #choices)]
-	pat.changeAt = now + 60
+	pat.changeAt = now + 5
 	pat.segLeft = 0
 	pat.t = 0
 	pat.theta = rnd(0, TAU)
 	pat.a = rnd(0, TAU)
 	pat.ang = 0
 	pat.crossIdx = 0
+	pat.p = rnd(0, TAU)
+	pat.q = rnd(0, TAU)
+	pat.qw = 0
+	pat.Q = CFrame.Angles(0, rnd(0, TAU), 0)
 end
 
-
+-- returns a unit direction; fx,fz = flat forward vector of the target (for "Cross")
 local function patternDir(dt, fx, fz)
 	local s = pat.style
 	pat.segLeft = pat.segLeft - dt
 	pat.t = pat.t + dt
 	local newSeg = pat.segLeft <= 0
 	local out
+	local shape = SHAPES[s]
 
-	if s == "Spin" then
+	if shape then
+		if newSeg then
+			pat.segLeft = rnd(0.15, 0.6)
+			pat.w = fastW()
+			pat.qw = rsign() * rnd(2, 9)
+			pat.Q = CFrame.Angles(rnd(-0.7, 0.7), rnd(0, TAU), rnd(-0.7, 0.7))
+		end
+		pat.p = pat.p + pat.w * dt
+		pat.q = pat.q + pat.qw * dt
+		local x, y, z = shape(pat.p, pat.q)
+		local v = pat.Q * Vector3.new(x, y, z)
+		local m = v.Magnitude
+		if m < 1e-4 then
+			v = Vector3.new(0.4, 0, 0)
+		elseif m < 0.4 then
+			v = v.Unit * 0.4
+		elseif m > 1.4 then
+			v = v.Unit * 1.4
+		end
+		out = v
+
+	elseif s == "Spin" then
 		if newSeg then
 			pat.segLeft = rnd(0.04, 0.3)
 			pat.w = fastW()
@@ -938,7 +1238,7 @@ local function patternDir(dt, fx, fz)
 			pat.cross = CROSS[i]
 		end
 		local d = pat.cross
-		local rx, rz = -fz, fx 
+		local rx, rz = -fz, fx -- target's right
 		out = Vector3.new(rx * d.X + fx * d.Z, d.Y, rz * d.X + fz * d.Z)
 
 	elseif s == "Lissajous" then
@@ -953,7 +1253,7 @@ local function patternDir(dt, fx, fz)
 		end
 		out = sph(pat.p1 + pat.f1 * pat.t, pat.amp * math.sin(pat.p2 + pat.f2 * pat.t))
 
-	else 
+	else -- Tumble
 		if newSeg then
 			pat.segLeft = rnd(0.08, 0.5)
 			local axis = Vector3.new(rnd(-1, 1), rnd(-1, 1), rnd(-1, 1))
@@ -981,14 +1281,14 @@ local function voidFloor(margin)
 	return -400
 end
 
-
-
-
+------------------------------------------------------------------
+-- Orbit engine
+------------------------------------------------------------------
 local orbit = {
-	state = "idle", 
-	kind = "player", 
+	state = "idle", -- idle | active | releasing
+	kind = "player", -- player | map
 	center = Vector3.zero,
-	start = nil, 
+	start = nil, -- CFrame where map orbit began
 	camSaved = nil,
 	releaseStart = 0,
 	last = 0,
@@ -1042,7 +1342,7 @@ local function groundPos(hrp, hum)
 	return nil
 end
 
-
+-- mode: "ground" (stop on the spot, upright, on the floor), "return" (map orbit: back to start), "none"
 local function finishOrbit(mode)
 	if orbit.state ~= "active" then
 		return
@@ -1071,7 +1371,7 @@ local function finishOrbit(mode)
 		hrp.AssemblyAngularVelocity = Vector3.zero
 	end
 
-	
+	-- stay non-colliding with zero velocity until nobody overlaps us, then restore
 	orbit.state = "releasing"
 	orbit.releaseStart = os.clock()
 end
@@ -1123,6 +1423,7 @@ function startMap()
 	local cam = workspace.CurrentCamera
 	orbit.camSaved = cam and cam.CFrame or nil
 	orbit.kind = "map"
+	orbit.byTeamer = false
 	orbit.last = os.clock()
 	rollPattern(os.clock())
 	orbit.state = "active"
@@ -1136,8 +1437,8 @@ function stopMap()
 	end
 end
 
-
-
+-- Runs from both RenderStepped and Heartbeat; the position is rebuilt from the
+-- target's current position every call, so there is no tween and no lag behind it.
 local function orbitFrame()
 	if orbit.state ~= "active" then
 		return
@@ -1158,7 +1459,7 @@ local function orbitFrame()
 		local target = State.selected
 		local troot = target and target.Character and target.Character:FindFirstChild("HumanoidRootPart")
 		if not troot then
-			return 
+			return -- target respawning: hold until it is back
 		end
 		local look = troot.CFrame.LookVector
 		local fx, fz = look.X, look.Z
@@ -1173,7 +1474,7 @@ local function orbitFrame()
 		local d = State.distance
 		local vy = dir.Y >= 0 and dir.Y * d or dir.Y * d * 0.35
 
-		
+		-- lead the target slightly so network delay doesn't leave us behind
 		local lead = troot.AssemblyLinearVelocity * 0.08
 		if lead.Magnitude > 15 then
 			lead = lead.Unit * 15
@@ -1249,7 +1550,7 @@ end)
 
 RunService.Heartbeat:Connect(orbitFrame)
 
-
+-- you respawned
 player.CharacterAdded:Connect(function()
 	noclip.char = nil
 	noclip.original = {}
@@ -1262,9 +1563,9 @@ player.CharacterAdded:Connect(function()
 	end
 end)
 
-
-
-
+------------------------------------------------------------------
+-- Camera (view + orbit spectate + map orbit), survives respawns
+------------------------------------------------------------------
 local forcingCamera = false
 local camScriptable = false
 
@@ -1295,7 +1596,7 @@ local function updateCamera()
 			end
 		end
 	elseif mapFrozen then
-		
+		-- keep the view at your start instead of following you into the distance
 		camScriptable = true
 		forcingCamera = true
 		cam.CameraType = Enum.CameraType.Scriptable
@@ -1320,9 +1621,9 @@ RunService.RenderStepped:Connect(function()
 	orbitFrame()
 end)
 
-
-
-
+------------------------------------------------------------------
+-- Finder actions
+------------------------------------------------------------------
 function setView(on)
 	if on then
 		if not State.selected then
@@ -1351,7 +1652,7 @@ function teleportToTarget()
 		return
 	end
 
-	
+	-- cancel orbit / map orbit first (no snapping, we're about to move anyway)
 	if orbit.state == "active" then
 		finishOrbit("none")
 	end
@@ -1365,20 +1666,20 @@ function teleportToTarget()
 	end
 	flat = flat.Unit
 	local tp = troot.Position
-	local pos = tp - flat * 6 
+	local pos = tp - flat * 6 -- behind them, not inside them
 	myRoot.CFrame = CFrame.lookAt(pos, Vector3.new(tp.X, pos.Y, tp.Z))
 	myRoot.AssemblyLinearVelocity = Vector3.zero
 	myRoot.AssemblyAngularVelocity = Vector3.zero
 
-	
+	-- non-colliding with zero velocity until nobody overlaps us (no fling)
 	orbit.state = "releasing"
 	orbit.releaseStart = os.clock()
 	setStatus("Teleported to " .. t.Name)
 end
 
-
-
-
+------------------------------------------------------------------
+-- Auto target
+------------------------------------------------------------------
 local function playerFromInstance(inst)
 	while inst and inst ~= workspace do
 		local p = Players:GetPlayerFromCharacter(inst)
@@ -1441,9 +1742,9 @@ function autoTarget()
 	end
 end
 
-
-
-
+------------------------------------------------------------------
+-- Damage trigger for "Auto map orbit when damaged"
+------------------------------------------------------------------
 do
 	local lastHum, lastHealth = nil, 0
 	RunService.Heartbeat:Connect(function()
@@ -1467,9 +1768,9 @@ do
 	end)
 end
 
-
-
-
+------------------------------------------------------------------
+-- ESP (box / skeleton / chams / names)
+------------------------------------------------------------------
 local espFolder
 do
 	local function containers()
@@ -1522,7 +1823,7 @@ local R6_BONES = {
 	{ "Torso", "Left Leg" }, { "Torso", "Right Leg" },
 }
 
-local esp = {} 
+local esp = {} -- [player] = { char, built, items, bones, hl, box, tag, label, col }
 
 local function clearEntry(e)
 	for _, inst in ipairs(e.items) do
@@ -1601,6 +1902,78 @@ local function buildEntry(e, char)
 end
 
 local lastTag = 0
+
+local function wantsEsp(p)
+	return State.espAll or State.espIds[p.UserId] == true
+end
+
+local function updateEsp(p, e, cfg, tagTick)
+	local char = p.Character
+
+	-- rebuild when the character changed or was destroyed (death, respawn, rejoin)
+	if e.char ~= char or (e.built and not (char and char.Parent)) then
+		clearEntry(e)
+		e.char = char
+	end
+	-- ... or lost a part we draw on
+	if e.built then
+		for _, b in ipairs(e.bones) do
+			if not (b.a:IsDescendantOf(char) and b.b:IsDescendantOf(char)) then
+				clearEntry(e)
+				e.char = char
+				break
+			end
+		end
+	end
+	if char and not e.built then
+		e.built = buildEntry(e, char)
+	end
+	if not e.built then
+		return
+	end
+
+	local col = (p == State.selected) and COLOR_TARGET or COLOR_OTHER
+	if e.col ~= col then
+		e.col = col
+		e.hl.FillColor = col
+		e.hl.OutlineColor = col
+		e.box.Color3 = col
+		e.label.TextColor3 = col
+		for _, b in ipairs(e.bones) do
+			b.ad.Color3 = col
+		end
+	end
+	e.hl.Enabled = cfg.chams
+	e.box.Visible = cfg.box
+	e.tag.Enabled = cfg.names
+
+	for _, b in ipairs(e.bones) do
+		if cfg.skeleton then
+			local lb = b.a.CFrame:PointToObjectSpace(b.b.Position)
+			local len = lb.Magnitude
+			if len > 0.01 then
+				local up = math.abs(lb.Unit.Y) > 0.99 and Vector3.new(1, 0, 0) or Vector3.new(0, 1, 0)
+				b.ad.CFrame = CFrame.lookAt(lb * 0.5, lb, up)
+				b.ad.Size = Vector3.new(0.12, 0.12, len)
+				b.ad.Visible = true
+			else
+				b.ad.Visible = false
+			end
+		else
+			b.ad.Visible = false
+		end
+	end
+
+	if tagTick and cfg.names then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		local hrp = char:FindFirstChild("HumanoidRootPart")
+		local mine = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+		local dist = (hrp and mine) and (hrp.Position - mine.Position).Magnitude or 0
+		local hp = hum and hum.Health or 0
+		e.label.Text = string.format("%s\n[%d studs]  %d HP", p.DisplayName, math.floor(dist), math.floor(hp))
+	end
+end
+
 RunService.RenderStepped:Connect(function()
 	local cfg = State.esp
 	local any = cfg.box or cfg.skeleton or cfg.chams or cfg.names
@@ -1619,71 +1992,34 @@ RunService.RenderStepped:Connect(function()
 		lastTag = now
 	end
 
+	local seen = {}
 	for _, p in ipairs(Players:GetPlayers()) do
-		if p ~= player then
+		if p ~= player and wantsEsp(p) then
+			seen[p] = true
 			local e = esp[p]
 			if not e then
 				e = { items = {}, bones = {}, built = false }
 				esp[p] = e
 			end
-			local char = p.Character
-			if e.char ~= char then
+			-- one broken entry must never take the others down: rebuild it next frame
+			local ok = pcall(updateEsp, p, e, cfg, tagTick)
+			if not ok then
 				clearEntry(e)
-				e.char = char
+				e.char = nil
 			end
-			if char and not e.built then
-				e.built = buildEntry(e, char)
-			end
-
-			if e.built then
-				local col = (p == State.selected) and COLOR_TARGET or COLOR_OTHER
-				if e.col ~= col then
-					e.col = col
-					e.hl.FillColor = col
-					e.hl.OutlineColor = col
-					e.box.Color3 = col
-					e.label.TextColor3 = col
-					for _, b in ipairs(e.bones) do
-						b.ad.Color3 = col
-					end
-				end
-				e.hl.Enabled = cfg.chams
-				e.box.Visible = cfg.box
-				e.tag.Enabled = cfg.names
-
-				for _, b in ipairs(e.bones) do
-					if cfg.skeleton and b.a.Parent and b.b.Parent then
-						local lb = b.a.CFrame:PointToObjectSpace(b.b.Position)
-						local len = lb.Magnitude
-						if len > 0.01 then
-							local up = math.abs(lb.Unit.Y) > 0.99 and Vector3.new(1, 0, 0) or Vector3.new(0, 1, 0)
-							b.ad.CFrame = CFrame.lookAt(lb * 0.5, lb, up)
-							b.ad.Size = Vector3.new(0.12, 0.12, len)
-							b.ad.Visible = true
-						else
-							b.ad.Visible = false
-						end
-					else
-						b.ad.Visible = false
-					end
-				end
-
-				if tagTick and cfg.names then
-					local hum = char:FindFirstChildOfClass("Humanoid")
-					local hrp = char:FindFirstChild("HumanoidRootPart")
-					local mine = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-					local dist = (hrp and mine) and (hrp.Position - mine.Position).Magnitude or 0
-					local hp = hum and hum.Health or 0
-					e.label.Text = string.format("%s\n[%d studs]  %d HP", p.DisplayName, math.floor(dist), math.floor(hp))
-				end
-			end
+		end
+	end
+	for p, e in pairs(esp) do
+		if not seen[p] then
+			clearEntry(e)
+			esp[p] = nil
 		end
 	end
 end)
 
-
-
-
+------------------------------------------------------------------
+-- Hotkeys (all default to None)
+------------------------------------------------------------------
 UserInputService.InputBegan:Connect(function(input)
 	if input.UserInputType ~= Enum.UserInputType.Keyboard then
 		return
@@ -1704,6 +2040,7 @@ UserInputService.InputBegan:Connect(function(input)
 			binds[name] = input.KeyCode
 		end
 		refreshBind(name)
+		queueSave()
 		return
 	end
 
@@ -1728,9 +2065,9 @@ UserInputService.InputBegan:Connect(function(input)
 	end
 end)
 
-
-
-
+------------------------------------------------------------------
+-- Player leaving
+------------------------------------------------------------------
 Players.PlayerRemoving:Connect(function(p)
 	removeEntry(p)
 	local e = esp[p]
@@ -1741,9 +2078,91 @@ Players.PlayerRemoving:Connect(function(p)
 	if State.selected == p then
 		setSelected(nil)
 		if orbitRow.Value then
-			orbitRow:Set(false) 
+			orbitRow:Set(false) -- stops the player orbit (map orbit needs no target)
 		end
 		viewRow:Set(false)
 		setStatus(p.Name .. " left the server")
 	end
 end)
+
+------------------------------------------------------------------
+-- Anti-teamer: crowd near you -> map orbit; they leave -> back to your start
+------------------------------------------------------------------
+do
+	local crowdSince, calmSince = nil, nil
+	local lastCheck = 0
+
+	local function countNear(pos, radius)
+		local n = 0
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= player then
+				local r = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+				if r and (r.Position - pos).Magnitude <= radius then
+					n = n + 1
+				end
+			end
+		end
+		return n
+	end
+
+	RunService.Heartbeat:Connect(function()
+		if not State.teamer then
+			crowdSince, calmSince = nil, nil
+			return
+		end
+		local now = os.clock()
+		if now - lastCheck < 0.15 then
+			return
+		end
+		lastCheck = now
+		local radius, need = State.teamerRadius, State.teamerCount
+
+		if orbit.state == "active" and orbit.kind == "map" then
+			crowdSince = nil
+			if orbit.byTeamer then
+				if countNear(orbit.center, radius) < need then
+					calmSince = calmSince or now
+					if now - calmSince > 5 then
+						calmSince = nil
+						mapRow:Set(false) -- puts you back at your start
+						setStatus("Teamers gone - map orbit off")
+					end
+				else
+					calmSince = nil
+				end
+			end
+			return
+		end
+
+		calmSince = nil
+		local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+		if hrp and countNear(hrp.Position, radius) >= need then
+			crowdSince = crowdSince or now
+			if now - crowdSince > 0.3 then
+				crowdSince = nil
+				mapRow:Set(true)
+				if orbit.state == "active" and orbit.kind == "map" then
+					orbit.byTeamer = true
+					setStatus("Teamers detected - map orbit on")
+				end
+			end
+		else
+			crowdSince = nil
+		end
+	end)
+end
+
+------------------------------------------------------------------
+-- Saving (debounced) + finish startup
+------------------------------------------------------------------
+RunService.Heartbeat:Connect(function()
+	if saveDirty and os.clock() - saveDirty > 0.6 then
+		saveDirty = nil
+		saveConfig()
+	end
+end)
+
+for name in pairs(bindButtons) do
+	refreshBind(name) -- show loaded hotkeys
+end
+uiReady = true
